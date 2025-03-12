@@ -5,43 +5,36 @@ import config
 from solana.rpc.api import Client
 from SolanaSlotFinder import SolanaSlotFinder
 from solders.pubkey import Pubkey  # 导入 Pubkey
+from solana.rpc.types import Commitment
+
 
 CONFIG = config.CONFIG  # 直接使用 CONFIG
 
 
 class TransactionFetcher:
-    def __init__(self, rpc_url, slot_finder, start_datetime, end_datetime, file_name):
+    def __init__(self, rpc_url, slot_finder, start_slot, end_slot):
         """
-        初始化交易查询器（不再绑定 market_address）
+        初始化交易查询器（不再绑定 file_name）
         """
         self.solana_client = Client(rpc_url)
         self.slot_finder = slot_finder
-        self.start_datetime = start_datetime
-        self.end_datetime = end_datetime
-        self.start_timestamp = int(start_datetime.timestamp())
-        self.end_timestamp = int(end_datetime.timestamp())
-        self.start_slot = self.slot_finder.find_closest_slot(self.start_timestamp)
-        self.end_slot = self.slot_finder.find_closest_slot(self.end_timestamp)
+        self.start_slot = start_slot
+        self.end_slot = end_slot
 
-        # 组合完整的输出文件路径
+        # **文件输出目录**
         self.output_folder = os.path.join(CONFIG["output_path"], "SIGNATURE")
-        self.output_file = os.path.join(self.output_folder, file_name)  # 拼接路径 + 文件名
-
-        # 确保输出目录存在
-        os.makedirs(self.output_folder, exist_ok=True)
+        os.makedirs(self.output_folder, exist_ok=True)  # 确保目录存在
 
         print(f"TransactionFetcher initialized with node: {rpc_url}")
-        print(f"Output file: {self.output_file}")
 
     @classmethod
-    def from_slots(cls, rpc_url, slot_finder, start_slot, end_slot, file_name):
+    def from_slots(cls, rpc_url, slot_finder, start_slot, end_slot):
         """
         通过 Slot 直接初始化（不需要时间戳）
         :param rpc_url: Solana RPC 端点
         :param slot_finder: SolanaSlotFinder 实例
         :param start_slot: 起始 Slot
         :param end_slot: 结束 Slot
-        :param file_name: 交易签名文件名
         """
         instance = cls.__new__(cls)  # 直接创建实例，不调用 __init__
         instance.solana_client = Client(rpc_url)
@@ -53,17 +46,13 @@ class TransactionFetcher:
         instance.start_timestamp = None
         instance.end_timestamp = None
 
-        # 组合完整的输出文件路径
+        # **文件输出目录**
         instance.output_folder = os.path.join(CONFIG["output_path"], "SIGNATURE")
-        instance.output_file = os.path.join(instance.output_folder, file_name)  # 拼接路径 + 文件名
-
-        # 确保输出目录存在
-        os.makedirs(instance.output_folder, exist_ok=True)
+        os.makedirs(instance.output_folder, exist_ok=True)  # 确保目录存在
 
         print(f"TransactionFetcher initialized with node: {rpc_url}")
-        print(f"Output file: {instance.output_file}")
 
-        return instance  # 返回初始化后的对象
+        return instance  # **不在这里设置 `file_name`**
 
     def fetch_transactions_by_signature(self, market_pubkey, signature, limit, market_address):
         """
@@ -97,13 +86,15 @@ class TransactionFetcher:
         else:
             return
 
-    def fetch_transactions(self, market_address, limit=1000):
+
+    def fetch_transactions(self, market_address,file_name,limit=1000):
         """
         查询指定时间范围内的交易，并存入 CSV（去重插入）
         :param market_address: 目标账户地址
         :param limit: 每次查询的最大交易数
         """
         market_pubkey = Pubkey.from_string(market_address)  # 在方法内解析 market_address
+        self.output_file = os.path.join(self.output_folder, file_name)  # **动态设置输出文件路径**
 
         print(f"Fetching transactions from Market Address: {market_address}")
 
@@ -131,6 +122,7 @@ class TransactionFetcher:
         # 处理并存储交易数据
         #self.save_transactions(response.value, self.start_slot, self.end_slot, market_address)
 
+
     def save_transactions(self, transactions, start_slot, end_slot, market_address):
         """
         读取已有交易数据，去重后插入新交易
@@ -141,7 +133,7 @@ class TransactionFetcher:
         """
         if not transactions:
             print("⚠️ No transactions found.")
-            return
+            return 0
 
         # 读取已有交易签名，避免重复插入
         existing_signatures = set()
@@ -175,6 +167,7 @@ class TransactionFetcher:
 
         # 打印存储信息
         print(f"✅ {new_entries} new transactions saved to {self.output_file} | Last Slot :{last_slot}")
+        return new_entries
 
 
 # ========== 使用示例 ==========
@@ -189,9 +182,8 @@ if __name__ == "__main__":
     market_address = "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj"
     #fetcher.fetch_transactions(market_address)
 
-    start_slot = 323247260
-    end_slot = 323247270
+    start_slot = 323247000
+    end_slot = 323247500
 
-    fetcher = TransactionFetcher.from_slots(rpc_url, slot_finder, start_slot, end_slot, file_name)
-    fetcher.fetch_transactions(market_address)
-
+    fetcher = TransactionFetcher.from_slots(rpc_url, slot_finder, start_slot, end_slot)
+    fetcher.fetch_transactions(market_address,file_name)

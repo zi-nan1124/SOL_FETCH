@@ -4,12 +4,16 @@ import os
 from solana.rpc.api import Client
 from solders.signature import Signature
 import config
+import time
+import threading
 
 CONFIG = config.CONFIG  # 直接使用 CONFIG
 
 
 class LogDecoder:
-    def __init__(self, rpc_url, log_enabled=False):
+    _global_lock = threading.Lock()  # 共享锁
+
+    def __init__(self, rpc_url, log_enabled=True):
         """
         初始化 Solana RPC 连接
         :param rpc_url: Solana RPC 端点
@@ -19,11 +23,12 @@ class LogDecoder:
         self.log_enabled = log_enabled  # 控制日志输出
 
         # 常见稳定币地址映射（Solana 主网）
-        self.stablecoins = {
+        self.coins = {
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
-            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT"
-        }
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
+            "So11111111111111111111111111111111111111112": "WSOL"
 
+        }
         print(f"LogDecoder initialized with RPC: {rpc_url}")
 
     def log(self, message):
@@ -31,24 +36,54 @@ class LogDecoder:
         if self.log_enabled:
             print(message)
 
+
+    def get_transaction_with_retries(self, tx_signature, max_retries=100, wait_time=1):
+        """
+        带重试机制的 Solana 交易查询
+        :param tx_signature: 交易签名
+        :param max_retries: 最大重试次数
+        :param wait_time: 每次重试的等待时间（秒）
+        :return: 交易详情（dict） 或 None（查询失败）
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                tx_details = self.solana_client.get_transaction(tx_signature, max_supported_transaction_version=0)
+
+                # 如果交易未找到
+                if tx_details.value is None:
+                    self.log("⚠️ Transaction not found or is not confirmed yet.")
+                    return None  # 确保返回 None 而不是 []
+
+                # 成功返回交易详情
+                self.log(f"✅ Transaction {tx_signature} fetched successfully on attempt {attempt}")
+                return tx_details
+
+            except Exception as e:
+                self.log(f"❌ Error fetching transaction (attempt {attempt}/{max_retries}): {e}")
+
+                if attempt < max_retries:
+                    self.log(f"⏳ Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    self.log(f"🚨 All {max_retries} attempts failed. Skipping transaction {tx_signature}.")
+                    return None  # 所有重试都失败，返回 None
+
     def decode_transaction(self, transaction_signature, market_address):
         """
         解析指定交易的日志，并计算目标账户的代币余额变化，同时返回交易的 blockTime。
         """
-        self.log(f"🔍 Decoding transaction: {transaction_signature}")
+        #self.log(f"🔍 Decoding transaction: {transaction_signature}")
 
         # 转换交易签名
         tx_signature = Signature.from_string(transaction_signature)
 
-        # 获取交易数据
-        try:
-            tx_details = self.solana_client.get_transaction(tx_signature, max_supported_transaction_version=0)
-            if tx_details.value is None:
-                self.log("⚠️ Transaction not found or is not confirmed yet.")
-                return []
-        except Exception as e:
-            self.log(f"❌ Error fetching transaction: {e}")
-            return []
+        # **使用带重试机制的 get_transaction**
+        tx_details = self.get_transaction_with_retries(tx_signature)
+
+        if tx_details is None:
+            print("\nerror! get_transaction_with_retries failed.")
+            self.log(f"⚠️ Skipping transaction {transaction_signature} due to repeated failures.")
+            return {"blockTime": None, "balanceChanges": []}  # 返回空结果
 
         # 解析 JSON 数据
         tx_details = json.loads(tx_details.value.to_json())
@@ -78,7 +113,7 @@ class LogDecoder:
             post_amount = post_balances.get(mint, 0)
             change = post_amount - pre_amount
             balance_changes.append({
-                "Token": self.stablecoins.get(mint, mint),
+                "Token": self.coins.get(mint, mint),
                 "Mint": mint,
                 "Pre Balance": pre_amount,
                 "Post Balance": post_amount,
@@ -90,11 +125,11 @@ class LogDecoder:
             "balanceChanges": balance_changes
         }
 
-    def decode(self, transaction_signature, market_address, non_stable_symbol):
+    def decode(self, transaction_signature, market_address):
         """
-        解析并检查是否是交换事件，并计算非稳定币价格
+        解析交易日志，并直接记录两个代币的 Change 和 Symbol
         """
-        # 调用 decode_transaction 并获取 blockTime 和 balanceChanges
+        # 获取交易数据
         transaction_data = self.decode_transaction(transaction_signature, market_address)
 
         # 提取 blockTime 和 balanceChanges
@@ -105,62 +140,39 @@ class LogDecoder:
             self.log("没有余额变化")
             return
 
-        # 统计正负 `Change` 数量
-        positive_changes = [c for c in balance_changes if c["Change"] > 0]
-        negative_changes = [c for c in balance_changes if c["Change"] < 0]
+        # 记录变动的代币
+        if len(balance_changes) == 2:  # 仅当有两个代币变动时
+            token1, token2 = balance_changes
 
-        if len(positive_changes) == 1 and len(negative_changes) == 1:
-            self.log(f"✅ 交易 {transaction_signature} 是交换事件")
-            self.log(f"账户 {market_address} 代币余额变动如下：")
-
-            stablecoin, non_stablecoin = None, None
-
-            for change in positive_changes + negative_changes:
-                if change["Mint"] in self.stablecoins:
-                    stablecoin = change
-                else:
-                    non_stablecoin = change
-
-            if non_stablecoin:
-                non_stablecoin["Token"] = non_stable_symbol
+            #self.log(f"✅ 交易 {transaction_signature} 是交换事件")
+            #self.log(f"账户 {market_address} 代币余额变动如下：")
 
             for change in balance_changes:
                 self.log(
                     f"- 代币: {change['Token']}, 交易前: {change['Pre Balance']}, 交易后: {change['Post Balance']}, 变动: {change['Change']}")
 
-            # 计算非稳定币价格
-            if stablecoin and non_stablecoin:
-                stable_amount = abs(stablecoin["Change"])
-                non_stable_amount = abs(non_stablecoin["Change"])
-
-                if non_stable_amount > 0:
-                    price = stable_amount / non_stable_amount
-                    self.log(f"💰 估算的 {non_stablecoin['Token']} 价格: {price} {stablecoin['Token']}")
-
-                    # 传递 blockTime 到 save_to_csv
+            # 存储数据到 CSV
+            # 存储数据到 CSV，使用线程锁保护
+            try:
+                with LogDecoder._global_lock:
                     self.save_to_csv(
-                        non_stablecoin["Token"],
-                        stablecoin["Token"],
-                        transaction_signature,
-                        non_stable_amount,
-                        stable_amount,
-                        price,
-                        block_time  # 传递交易时间戳
+                        token1["Token"], token2["Token"], transaction_signature,
+                        abs(token1["Change"]), abs(token2["Change"]), block_time
                     )
+            except Exception as e:
+                print(f"❌ 写入 CSV 失败: {e}")
 
-    def save_to_csv(self, non_stable_symbol, stable_symbol, transaction_signature, non_stable_change, stable_change,
-                    price,block_time):
+
+    def save_to_csv(self, token1_symbol, token2_symbol, transaction_signature, token1_change, token2_change,
+                    block_time):
         """
-        将交易数据存入 CSV 文件，避免重复写入，并增加 BlockTime 列
+        将交易数据存入 CSV 文件，不区分稳定币，直接记录两种代币的 Change 和 Symbol
         """
         output_folder = os.path.join(CONFIG["output_path"], "DATA")
         os.makedirs(output_folder, exist_ok=True)
 
-        file_name = f"{non_stable_symbol}_{stable_symbol}.csv"
+        file_name = f"{token1_symbol}_{token2_symbol}.csv"
         output_file = os.path.join(output_folder, file_name)
-
-        # 获取交易的 BlockTime
-        block_time = block_time
 
         # 读取已有的交易签名，避免重复写入
         existing_signatures = set()
@@ -180,9 +192,10 @@ class LogDecoder:
 
             # 如果文件为空，则写入表头
             if os.stat(output_file).st_size == 0:
-                writer.writerow(["Signature", "Non-Stable Change", "Stable Change", "Price", "BlockTime"])
+                writer.writerow(["Signature", "Token1", "Token1_Change", "Token2", "Token2_Change", "BlockTime"])
 
-            writer.writerow([transaction_signature, non_stable_change, stable_change, price, block_time])
+            writer.writerow(
+                [transaction_signature, token1_symbol, token1_change, token2_symbol, token2_change, block_time])
 
         self.log(f"✅ 交易数据已存入 {output_file}，BlockTime: {block_time}")
 
@@ -210,8 +223,7 @@ if __name__ == "__main__":
     # 这里 `log_enabled=True` 开启日志输出
     log_decoder = LogDecoder(rpc_url)
 
-    transaction_signature = "2oYXdAh6C8Q21fFby7wZ1jApmpiC69nLDCBTFQbSeVbNPLBdjUTqFQFgmcA2mto4jdeEFJZAKweSNG9MUv93VKrc"
-    market_address = "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj"
-    symbol = "SOL"
+    transaction_signature = "3XZp6PAJT9e2k2t5U1mdo2kc9boDG69JjeV5oUwquNG3SLJigQMDHoYhb7TrZUsHCSyMDyV4r4QSH6ynuw17Jj89"
+    market_address = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
 
-    log_decoder.decode(transaction_signature, market_address, symbol)
+    log_decoder.decode(transaction_signature, market_address)
